@@ -1,15 +1,19 @@
 import { Router } from "express";
 import { nanoid } from "nanoid";
-import { readSessions, writeSessions } from "../utils/store.js";
+import { readStore, writeStore } from "../utils/store.js";
 import { generateSlots } from "../utils/slots.js";
 import { rankSlots, totalParticipants } from "../utils/suggest.js";
+import { parseIcsEvents, slotsCoveredByEvents } from "../utils/ics.js";
+import { optionalAuth, requireAuth } from "../middleware/auth.js";
 
 const router = Router();
-
+const FILE = "sessions.json";
 const VALID_STATUSES = ["preferred", "okay", "avoid"];
 
-// Create a new session
-router.post("/", async (req, res) => {
+// Create a new session. Signed-in users get it attached to their account
+// (shows up on their dashboard); guests can still create sessions, they
+// just won't see them listed anywhere later.
+router.post("/", optionalAuth, async (req, res) => {
   const { title, startDate, endDate, startHour = 8, endHour = 20, blockMinutes = 30 } = req.body;
 
   if (!title || !startDate || !endDate) {
@@ -22,7 +26,7 @@ router.post("/", async (req, res) => {
   }
 
   const id = nanoid(8);
-  const sessions = await readSessions();
+  const sessions = await readStore(FILE);
   sessions[id] = {
     id,
     title,
@@ -32,17 +36,33 @@ router.post("/", async (req, res) => {
     endHour,
     blockMinutes,
     slots,
+    ownerId: req.user?.id || null,
     participants: {}, // { name: { slotId: status } }
     createdAt: new Date().toISOString(),
   };
-  await writeSessions(sessions);
+  await writeStore(FILE, sessions);
 
   res.status(201).json(sessions[id]);
 });
 
+// Sessions belonging to the signed-in user (dashboard)
+router.get("/mine", requireAuth, async (req, res) => {
+  const sessions = await readStore(FILE);
+  const mine = Object.values(sessions)
+    .filter((s) => s.ownerId === req.user.id)
+    .map((s) => ({
+      id: s.id,
+      title: s.title,
+      createdAt: s.createdAt,
+      participantCount: totalParticipants(s.participants),
+    }))
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  res.json({ sessions: mine });
+});
+
 // Get a session (for joining / rendering the grid)
 router.get("/:id", async (req, res) => {
-  const sessions = await readSessions();
+  const sessions = await readStore(FILE);
   const session = sessions[req.params.id];
   if (!session) return res.status(404).json({ error: "session not found" });
   res.json(session);
@@ -55,11 +75,10 @@ router.post("/:id/join", async (req, res) => {
     return res.status(400).json({ error: "name and availability are required" });
   }
 
-  const sessions = await readSessions();
+  const sessions = await readStore(FILE);
   const session = sessions[req.params.id];
   if (!session) return res.status(404).json({ error: "session not found" });
 
-  // Only keep valid slot ids and valid statuses
   const cleaned = {};
   for (const [slotId, status] of Object.entries(availability)) {
     if (session.slots.includes(slotId) && VALID_STATUSES.includes(status)) {
@@ -68,14 +87,14 @@ router.post("/:id/join", async (req, res) => {
   }
 
   session.participants[name] = cleaned;
-  await writeSessions(sessions);
+  await writeStore(FILE, sessions);
 
   res.json({ ok: true, participantCount: totalParticipants(session.participants) });
 });
 
 // Get ranked results / suggested best times
 router.get("/:id/results", async (req, res) => {
-  const sessions = await readSessions();
+  const sessions = await readStore(FILE);
   const session = sessions[req.params.id];
   if (!session) return res.status(404).json({ error: "session not found" });
 
@@ -86,24 +105,25 @@ router.get("/:id/results", async (req, res) => {
     title: session.title,
     participantCount,
     participants: Object.keys(session.participants),
-    ranked, // sorted best-first: [{slotId, availableCount, weightedScore}, ...]
+    ranked,
   });
 });
 
-// Stub for .ics calendar import — read-only, no OAuth needed.
-// A real implementation would parse VEVENT blocks and mark those slots
-// as unavailable ("busy") before the user taps anything manually.
+// Parse an uploaded .ics file and return which of this session's slots
+// overlap the user's existing calendar events, so the frontend can
+// pre-mark those as unavailable before the user taps anything by hand.
 router.post("/:id/import-ics", async (req, res) => {
   const { icsText } = req.body;
   if (!icsText) return res.status(400).json({ error: "icsText is required" });
 
-  // TODO: parse icsText (e.g. with the "ical.js" or "node-ical" package),
-  // extract VEVENT start/end times, map them onto this session's slot ids,
-  // and pre-mark those as busy for the joining participant.
-  res.json({
-    ok: true,
-    note: "Parsing not yet implemented — see the TODO in import-ics for next steps.",
-  });
+  const sessions = await readStore(FILE);
+  const session = sessions[req.params.id];
+  if (!session) return res.status(404).json({ error: "session not found" });
+
+  const events = parseIcsEvents(icsText);
+  const covered = slotsCoveredByEvents(session.slots, events, session.blockMinutes);
+
+  res.json({ ok: true, busySlotIds: Array.from(covered), eventsFound: events.length });
 });
 
 export default router;
